@@ -37,7 +37,7 @@ def get_sampler() -> torch.nn.Module:
     if envs.VLLM_USE_V1:
         # Lazy import: the v1 package isn't distributed
         from vllm.v1.sample.sampler import Sampler as V1Sampler
-        return V1Sampler()
+        return V1Sampler(post_process_logprobs=envs.POST_PROCESS_LOGPROBS)
     return Sampler()
 
 

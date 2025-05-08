@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -13,6 +13,7 @@ logger = init_logger(__name__)
 
 try:
     import flashinfer.sampling
+
     is_flashinfer_available = True
 except ImportError:
     is_flashinfer_available = False
@@ -72,14 +73,7 @@ class TopKTopPSampler(nn.Module):
                     "best performance, please install FlashInfer.")
                 self.forward = self.forward_native
         elif current_platform.is_tpu():
-            if envs.VLLM_TPU_DISABLE_TOPK_TOPP_OPTIMIZATION:
-                logger.warning(
-                    "TPU-specific optimization for top-k & top-p sampling are "
-                    "disabled, falling back to PyTorch-native implementation "
-                    "which could be very slow.")
-                self.forward = self.forward_native
-            else:
-                self.forward = self.forward_tpu
+            self.forward = self.forward_tpu
         else:
             self.forward = self.forward_native
 
@@ -89,7 +83,8 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: Optional[torch.Tensor],
         p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        return_logits: bool = False,
+    ) -> tuple[torch.Tensor, Union[torch.Tensor, None]]:
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
@@ -97,7 +92,10 @@ class TopKTopPSampler(nn.Module):
         """
         logits = apply_top_k_top_p(logits, k, p)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
-        return random_sample(probs, generators)
+        sample = random_sample(probs, generators)
+        if return_logits:
+            return sample, logits
+        return sample, None
 
     def forward_cuda(
         self,
@@ -105,15 +103,29 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: Optional[torch.Tensor],
         p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        return_logits: bool = False,
+    ) -> tuple[torch.Tensor, Union[torch.Tensor, None]]:
         """More optimized implementation for top-k and top-p sampling."""
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         if k is None and p is None:
             # We prefer `random_sample` over `flashinfer_sample` when sorting is
             # not needed. This is because `random_sample` does not require
             # CPU-GPU synchronization while `flashinfer_sample` does.
-            return random_sample(probs, generators)
-        return flashinfer_sample(probs, k, p, generators)
+            sample = random_sample(probs, generators)
+            # Logits aren't changed here!
+        else:
+            sample, probs = flashinfer_sample(probs, k, p, generators,
+                                              return_logits)
+            if return_logits:
+                assert probs is not None
+                # Set logits to -inf where probs were set to 0.0.
+                mask_value = torch.scalar_tensor(float("-inf"),
+                                                 dtype=logits.dtype,
+                                                 device=logits.device)
+                torch.where(probs.eq(0.0), mask_value, logits, out=logits)
+        if return_logits:
+            return sample, logits
+        return sample, None
 
     def forward_tpu(
         self,
@@ -121,10 +133,14 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: Optional[torch.Tensor],
         p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        return_logits: bool = False,
+    ) -> tuple[torch.Tensor, Union[torch.Tensor, None]]:
         logits = apply_top_k_top_p_tpu(logits, k, p)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
-        return random_sample(probs, generators)
+        sample = random_sample(probs, generators)
+        if return_logits:
+            return sample, logits
+        return sample, None
 
 
 def apply_top_k_top_p_tpu(
@@ -146,12 +162,22 @@ def apply_top_k_top_p_tpu(
     chance of being chosen during final sampling, so we can consider the tie
     being broken then.
     """
+    probs = logits.softmax(dim=-1)
+    probs_sort, _ = probs.sort(dim=-1, descending=False)
+
     if k is not None:
-        logits = apply_top_k_only(logits, k)
+        top_k_count = probs_sort.size(1) - k.to(torch.long)  # shape: (batch, )
+        top_k_count = top_k_count.unsqueeze(dim=1)
+        top_k_cutoff = probs_sort.gather(-1, top_k_count)
+
+        # Make sure the no top-k rows are no-op.
+        no_top_k_mask = (k == logits.shape[1]).unsqueeze(dim=1)
+        top_k_cutoff.masked_fill_(no_top_k_mask, -float("inf"))
+
+        elements_to_discard = probs < top_k_cutoff
+        logits.masked_fill_(elements_to_discard, -float("inf"))
 
     if p is not None:
-        probs = logits.softmax(dim=-1)
-        probs_sort, _ = probs.sort(dim=-1, descending=False)
         cumprob = torch.cumsum(probs_sort, dim=-1)
         top_p_mask = cumprob <= 1 - p.unsqueeze(dim=1)
         top_p_mask[:, -1] = False  # at least one
@@ -224,7 +250,7 @@ def apply_top_k_only(
     max_top_k = k.max()
     # topk.values tensor has shape [batch_size, max_top_k].
     # Convert top k to 0-based index in range [0, max_top_k).
-    k_index = k.sub_(1).unsqueeze(1).expand(logits.shape[0], 1)
+    k_index = k.sub_(1).unsqueeze(1)
     top_k_mask = logits.topk(max_top_k, dim=1).values.gather(1, k_index.long())
     # Handle non-topk rows.
     top_k_mask.masked_fill_(no_top_k_mask.unsqueeze(1), -float("inf"))
@@ -261,13 +287,14 @@ def flashinfer_sample(
     k: Optional[torch.Tensor],
     p: Optional[torch.Tensor],
     generators: dict[int, torch.Generator],
-) -> torch.Tensor:
+    return_probs: bool,
+) -> tuple[torch.Tensor, Union[torch.Tensor, None]]:
     """Sample from the probabilities using FlashInfer.
 
     Statistically, this function is equivalent to the `random_sample` function.
     However, this function is faster because it avoids sorting the logits tensor
     via rejection sampling.
-    
+
     NOTE: The outputs of this function do not necessarily match the outputs of
     the `random_sample` function. It only guarantees that the outputs are
     statistically equivalent.
@@ -287,26 +314,32 @@ def flashinfer_sample(
         for i, generator in generators.items():
             uniform_samples[:, i].uniform_(generator=generator)
 
-    if k is None:
-        # Top-p only.
-        next_token_ids, success = flashinfer.sampling.top_p_sampling_from_probs(
-            probs, uniform_samples, p, deterministic=True)
-    elif p is None:
-        # Top-k only.
-        next_token_ids, success = flashinfer.sampling.top_k_sampling_from_probs(
-            probs, uniform_samples, k, deterministic=True)
-    else:
-        # Both top-k and top-p.
-        next_token_ids, success = (
-            flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, uniform_samples, k, p, deterministic=True))
+    if not return_probs:
+        if k is None:
+            # Top-p only.
+            next_token_ids, success = (
+                flashinfer.sampling.top_p_sampling_from_probs(
+                    probs, uniform_samples, p, deterministic=True))
+        elif p is None:
+            # Top-k only.
+            next_token_ids, success = (
+                flashinfer.sampling.top_k_sampling_from_probs(
+                    probs, uniform_samples, k, deterministic=True))
+        else:
+            # Both top-k and top-p.
+            next_token_ids, success = (
+                flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                    probs, uniform_samples, k, p, deterministic=True))
 
     # NOTE: CPU-GPU synchronization happens here.
-    if not success.all():
+    if return_probs or not success.all():
         if k is not None:
             probs = flashinfer.sampling.top_k_renorm_prob(probs, k)
         if p is not None:
             probs = flashinfer.sampling.top_p_renorm_prob(probs, p)
         next_token_ids = flashinfer.sampling.sampling_from_probs(
             probs, uniform_samples[0], deterministic=True)
-    return next_token_ids.view(-1)
+    sample = next_token_ids.view(-1)
+    if return_probs:
+        return sample, probs
+    return sample, None

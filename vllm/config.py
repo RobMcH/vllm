@@ -328,6 +328,7 @@ class ModelConfig:
         enforce_eager: Optional[bool] = None,
         max_seq_len_to_capture: Optional[int] = None,
         max_logprobs: int = 20,
+        post_process_logprobs: bool = False,
         disable_sliding_window: bool = False,
         disable_cascade_attn: bool = False,
         skip_tokenizer_init: bool = False,
@@ -410,6 +411,8 @@ class ModelConfig:
         self.enforce_eager = enforce_eager
         self.max_seq_len_to_capture = max_seq_len_to_capture
         self.max_logprobs = max_logprobs
+        self.post_process_logprobs = post_process_logprobs
+        envs.POST_PROCESS_LOGPROBS = post_process_logprobs
         self.disable_sliding_window = disable_sliding_window
         self.disable_cascade_attn = disable_cascade_attn
         self.skip_tokenizer_init = skip_tokenizer_init
