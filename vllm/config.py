@@ -412,7 +412,7 @@ class ModelConfig:
         self.max_seq_len_to_capture = max_seq_len_to_capture
         self.max_logprobs = max_logprobs
         self.post_process_logprobs = post_process_logprobs
-        envs.POST_PROCESS_LOGPROBS = post_process_logprobs
+        envs.set_postprocess_logprobs(post_process_logprobs)
         self.disable_sliding_window = disable_sliding_window
         self.disable_cascade_attn = disable_cascade_attn
         self.skip_tokenizer_init = skip_tokenizer_init

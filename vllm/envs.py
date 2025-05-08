@@ -705,6 +705,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # It can be changed with this variable if needed for some reason.
     "VLLM_XGRAMMAR_CACHE_MB":
     lambda: int(os.getenv("VLLM_XGRAMMAR_CACHE_MB", "512")),
+    "POST_PROCESS_LOGPROBS":
+    lambda: bool(int(os.getenv("POST_PROCESS_LOGPROBS", "0"))),
 }
 
 # end-env-vars-definition
@@ -735,6 +737,10 @@ def set_vllm_use_v1(use_v1: bool):
             "explicitly by the user. Please raise this as a Github "
             "Issue and explicitly set VLLM_USE_V1=0 or 1.")
     os.environ["VLLM_USE_V1"] = "1" if use_v1 else "0"
+
+
+def set_postprocess_logprobs(post_process_logprobs: bool):
+    os.environ["POST_PROCESS_LOGPROBS"] = "1" if post_process_logprobs else "0"
 
 
 def compute_hash() -> str:
