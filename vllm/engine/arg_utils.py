@@ -250,7 +250,7 @@ class EngineArgs:
         SchedulerConfig.long_prefill_token_threshold
     max_num_seqs: Optional[int] = SchedulerConfig.max_num_seqs
     max_logprobs: int = 20  # Default value for OpenAI Chat Completions API
-    post_process_logprobs: bool = ModelConfig.post_process_logprobs
+    post_process_logprobs: bool = False
     disable_log_stats: bool = False
     revision: Optional[str] = None
     code_revision: Optional[str] = None
@@ -594,12 +594,6 @@ class EngineArgs:
             default=EngineArgs.max_logprobs,
             help=('Max number of log probs to return logprobs is specified in'
                   ' SamplingParams.'))
-        parser.add_argument(
-            "--post-process-logprobs",
-            action="store_true",
-            help="When ``--post-process-logprobs`` is specified, the sampled"
-            " logprobs will be calculated after applying temperature,"
-            " top-k, top-p, etc rather than before (default).")
         parser.add_argument('--disable-log-stats',
                             action='store_true',
                             help='Disable logging statistics.')
